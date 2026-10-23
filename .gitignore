@@ -1,0 +1,14 @@
+PLAN.md
+ref/
+data/
+ground_truth/
+runs/
+logs/
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+ELT-Bench/
+*.egg-info/
+.pytest_cache/

@@ -1,0 +1,20 @@
+[project]
+name = "elt-bench-tinker"
+version = "0.1.0"
+description = "ELT-Bench as an RLVR environment on tinker-cookbook"
+requires-python = ">=3.11"
+dependencies = [
+    "tinker_cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook@54b3cb2",
+    "psycopg[binary]>=3.1",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["elt_rl", "elt_rl.warehouse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
