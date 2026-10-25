@@ -20,7 +20,6 @@ from elt_rl.sandbox import LocalSandbox, make_workspace
 from elt_rl.task import Task, load_task
 from elt_rl.tools import EltTools
 from elt_rl.warehouse.base import Episode, Warehouse
-from elt_rl.warehouse.postgres import PostgresWarehouse
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +30,18 @@ SYSTEM_PROMPT = (
 )
 
 
-def instruction(task: Task) -> str:
+def instruction(task: Task, episode: Episode) -> str:
+    ns = episode.namespace
     return (
         f"Task `{task.name}`. Your workspace has `data_model.yaml` (target models and column "
         "semantics), `schemas/` (source column descriptions) and `sources/` (raw source data, "
         f"one CSV per source table).\n\n"
-        f"1. Extract & load: load every source table into schema `{task.name}` of the "
-        "warehouse, keeping its name (e.g. `sources/x.csv` -> table "
-        f"`{task.name}.x`).\n"
-        f"2. Transform: create each model in `data_model.yaml` as a table `{task.name}.<model>` "
+        f"1. Extract & load: load every source table into `{ns}`, keeping its name "
+        f"(e.g. `sources/x.csv` -> table `{ns}.x`).\n"
+        f"2. Transform: create each model in `data_model.yaml` as a table `{ns}.<model>` "
         "with exactly the listed columns.\n"
-        "The shell is already connected to your warehouse (`psql` works; `\\copy` reads "
-        "workspace files). Call `submit` when done."
+        f"The shell is already connected to your warehouse: {episode.shell_hint} "
+        "Call `submit` when done."
     )
 
 
@@ -71,11 +70,11 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         self._episodes: list[Episode] = []
         self._sandboxes: list[LocalSandbox] = []
 
-    def _initial_messages(self, tools: EltTools) -> list[Message]:
+    def _initial_messages(self, tools: EltTools, episode: Episode) -> list[Message]:
         prefix = self.renderer.create_conversation_prefix_with_tools(
             tools=[t.to_spec() for t in tools.all()], system_prompt=SYSTEM_PROMPT
         )
-        return prefix + [{"role": "user", "content": instruction(self.task)}]
+        return prefix + [{"role": "user", "content": instruction(self.task, episode)}]
 
     async def make_envs(self) -> Sequence[Env]:
         envs = []
@@ -89,7 +88,7 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
                 build_agent_tool_env(
                     renderer=self.renderer,
                     tools=tools.all(),
-                    initial_messages=self._initial_messages(tools),
+                    initial_messages=self._initial_messages(tools, episode),
                     reward_fn=EltReward(self.task, self.warehouse, episode, self.comparator),
                     max_turns=self.max_turns,
                     max_trajectory_tokens=self.max_trajectory_tokens,
@@ -126,13 +125,30 @@ class EltDataset(RLDataset):
         return (len(self.builders) + self.batch_size - 1) // self.batch_size
 
 
+def make_warehouse(kind: str, postgres_dsn: str | None = None) -> Warehouse:
+    # Imported lazily so each backend's driver is only needed when used.
+    if kind == "postgres":
+        from elt_rl.warehouse.postgres import PostgresWarehouse
+
+        if not postgres_dsn:
+            raise ValueError("warehouse=postgres needs postgres_dsn")
+        return PostgresWarehouse(postgres_dsn)
+    if kind == "snowflake":
+        from elt_rl.warehouse.snowflake import SnowflakeWarehouse
+
+        return SnowflakeWarehouse.from_env()
+    raise ValueError(f"unknown warehouse {kind!r}")
+
+
 @chz.chz
 class EltDatasetBuilder(RLDatasetBuilder):
     task_names: list[str]
     elt_bench_dir: str
     data_dir: str
-    postgres_dsn: str
     model_name: str
+    # "postgres" (needs postgres_dsn) or "snowflake" (reads ELT_SF_* env vars).
+    warehouse: str = "postgres"
+    postgres_dsn: str | None = None
     batch_size: int = 1
     group_size: int = 2
     renderer_name: str | None = None
@@ -144,7 +160,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
         )
         renderer = get_renderer(renderer_name, tokenizer_utils.get_tokenizer(self.model_name))
         bench, data = Path(self.elt_bench_dir), Path(self.data_dir)
-        warehouse = PostgresWarehouse(self.postgres_dsn)
+        warehouse = make_warehouse(self.warehouse, self.postgres_dsn)
         comparator = load_comparator(bench)
         builders = [
             EltEnvGroupBuilder(

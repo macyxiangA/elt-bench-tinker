@@ -16,6 +16,11 @@ class Episode:
     task: str
     # Env vars the agent's shell gets to reach its own namespace (e.g. PGHOST...).
     agent_env: dict[str, str]
+    # Qualified prefix of the agent's tables, e.g. `trains` or `EP_1.AIRBYTE_SCHEMA`.
+    # ELT-Bench eval SQL names tables `<task>.<table>`; the grader maps that prefix here.
+    namespace: str
+    # One line telling the agent how its shell reaches the warehouse.
+    shell_hint: str
 
 
 @dataclass(frozen=True)

@@ -66,7 +66,13 @@ class PostgresWarehouse(Warehouse):
             "PGPASSWORD": password,
             "PGDATABASE": ep,
         }
-        return Episode(id=ep, task=task, agent_env=agent_env)
+        return Episode(
+            id=ep,
+            task=task,
+            agent_env=agent_env,
+            namespace=task,
+            shell_hint="`psql` is preconfigured; `\\copy` reads workspace files.",
+        )
 
     def drop_episode(self, episode: Episode) -> None:
         with self._admin() as conn:

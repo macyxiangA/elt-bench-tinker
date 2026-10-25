@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -27,6 +28,11 @@ def load_comparator(elt_bench_dir: Path) -> ModuleType:
     return module
 
 
+def to_physical(sql: str, task: str, namespace: str) -> str:
+    """ELT-Bench eval SQL uses `<task>.<table>`; point it at this episode's namespace."""
+    return re.sub(rf"\b{re.escape(task)}\.", f"{namespace}.", sql, flags=re.IGNORECASE)
+
+
 def _as_strings(df: pd.DataFrame) -> pd.DataFrame:
     # Same CSV round-trip as the official evaluator, so both sides parse alike.
     return pd.read_csv(io.StringIO(df.to_csv(index=False)), dtype=str, keep_default_na=True)
@@ -38,7 +44,9 @@ def score_model(
     """Official per-model result plus `score` = fraction of GT columns matched."""
     gt = pd.read_csv(task.gt_dir / f"{model}.csv", dtype=str, keep_default_na=True)
     try:
-        df = _as_strings(warehouse.fetch_df(episode, task.eval_sql[model]))
+        df = _as_strings(warehouse.fetch_df(
+            episode, to_physical(task.eval_sql[model], task.name, episode.namespace)
+        ))
     except Exception as e:  # missing table / bad SQL => nothing to grade
         return {"status": "error", "error": str(e), "match": False, "score": 0.0}
     keys = task.sort_keys.get(model, [])

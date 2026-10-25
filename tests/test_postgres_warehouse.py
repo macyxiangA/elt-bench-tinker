@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import psycopg
 import pytest
 
@@ -21,7 +23,7 @@ def test_episode_lifecycle_and_isolation(warehouse: PostgresWarehouse) -> None:
         # b's credentials cannot open a's database.
         other = dict(b.agent_env, PGDATABASE=a.id)
         with pytest.raises(psycopg.OperationalError):
-            warehouse.execute(type(b)(id=b.id, task=b.task, agent_env=other), "SELECT 1")
+            warehouse.execute(replace(b, agent_env=other), "SELECT 1")
     finally:
         warehouse.drop_episode(a)
         warehouse.drop_episode(b)

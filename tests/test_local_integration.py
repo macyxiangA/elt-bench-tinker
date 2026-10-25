@@ -7,14 +7,14 @@ tools, warehouse, official comparator) is the code used in training.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
-from tinker_cookbook.renderers.base import Message, ToolCall
+from tinker_cookbook.renderers.base import Message
 
 from elt_rl.env import EltEnvGroupBuilder
 from elt_rl.reward import load_comparator
+from elt_rl.scripted import TRAINS_TRANSFORM, PromptOnlyRenderer, call, run_scripted
 from elt_rl.task import load_task
 from elt_rl.warehouse.postgres import PostgresWarehouse
 
@@ -30,64 +30,22 @@ CREATE TABLE trains.cars (id int, train_id int, position int, shape text, len te
 SQL
 """
 
-TRANSFORM = """
-CREATE TABLE trains.trains AS
-SELECT t.id AS train_id,
-       t.direction,
-       CASE WHEN t.direction = 'east' AND COUNT(c.id) < 4 THEN 1 ELSE 0 END
-         AS run_east_and_has_less_than_4_cars,
-       CASE WHEN SUM(CASE WHEN c.len = 'long' THEN 1 ELSE 0 END) > 2 THEN 1 ELSE 0 END
-         AS has_more_than_2_long_cars,
-       MAX(CASE WHEN c.position = 3 AND c.sides = 'double' THEN 1 ELSE 0 END)
-         AS has_double_sided_cars_in_3rd_position,
-       MAX(CASE WHEN c.position = 1 AND c.shape = 'rectangle' THEN 1 ELSE 0 END)
-         AS has_rectangular_shaped_head_cars,
-       COALESCE(SUM(CASE WHEN c.roof = '{open_roof}' THEN 1 ELSE 0 END), 0)
-         AS number_of_open_roof_car
-FROM trains.train t LEFT JOIN trains.cars c ON c.train_id = t.id
-GROUP BY t.id, t.direction
-"""
-
-
-def call(name: str, **args: str) -> Message:
-    tc = ToolCall(function=ToolCall.FunctionBody(name=name, arguments=json.dumps(args)))
-    return {"role": "assistant", "content": "", "tool_calls": [tc]}
 
 
 PIPELINES: dict[str, list[Message]] = {
     "correct": [
         call("bash", command=LOAD),
-        call("sql", query=TRANSFORM.format(open_roof="none")),
+        call("sql", query=TRAINS_TRANSFORM.format(ns="trains", open_roof="none")),
         call("submit"),
     ],
     # Classic mistake (see ELT-Bench-Verified): the data has no 'open' roof value.
     "wrong": [
         call("bash", command=LOAD),
-        call("sql", query=TRANSFORM.format(open_roof="open")),
+        call("sql", query=TRAINS_TRANSFORM.format(ns="trains", open_roof="open")),
         call("submit"),
     ],
     "empty": [call("submit")],
 }
-
-
-class PromptOnlyRenderer:
-    """Stands in for a tokenizer-backed renderer; only builds the prompt prefix."""
-
-    def create_conversation_prefix_with_tools(self, tools, system_prompt: str = ""):
-        return [{"role": "system", "content": system_prompt}]
-
-    def get_stop_sequences(self) -> list[str]:
-        return []
-
-
-async def run_scripted(env, script: list[Message]) -> tuple[float, dict]:
-    msg_env = env.message_env
-    await msg_env.initial_observation()
-    for message in script:
-        result = await msg_env.step(message)
-        if result.episode_done:
-            return result.reward, result.metrics
-    raise AssertionError("script ended without finishing the episode")
 
 
 @pytest.mark.asyncio
