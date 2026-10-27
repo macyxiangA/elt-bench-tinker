@@ -1,8 +1,8 @@
 """Postgres warehouse: one database + one login role per episode.
 
-The task template database is created once; each episode is a
-`CREATE DATABASE ... TEMPLATE` copy owned by a throwaway role that cannot
-connect anywhere else. The grader uses the admin DSN.
+The task template database is created once and then closed to connections;
+each episode is a `CREATE DATABASE ... TEMPLATE` copy owned by a throwaway
+role that cannot connect anywhere else. The grader uses the admin DSN.
 """
 
 from __future__ import annotations
@@ -14,10 +14,14 @@ import psycopg
 from psycopg import sql as pgsql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-from elt_rl.warehouse.base import Episode, QueryResult, Warehouse
+from elt_rl.warehouse.base import Episode, QueryError, QueryResult, Warehouse
 
 
 class PostgresWarehouse(Warehouse):
+    sources_preloaded = False
+    # Local test setup: the sandbox reaches Postgres on the host's localhost.
+    sandbox_network = "host"
+
     def __init__(self, admin_dsn: str, statement_timeout_ms: int = 60_000):
         self.admin_dsn = admin_dsn
         self.statement_timeout_ms = statement_timeout_ms
@@ -31,13 +35,18 @@ class PostgresWarehouse(Warehouse):
 
     def ensure_template(self, task: str) -> None:
         """Template = empty target schema named after the task (ELT-Bench's `<task>.<model>`)."""
-        name = self._template(task)
+        db = pgsql.Identifier(self._template(task))
         with self._admin() as conn:
-            if conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone():
+            if conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (self._template(task),)
+            ).fetchone():
                 return
-            conn.execute(pgsql.SQL("CREATE DATABASE {}").format(pgsql.Identifier(name)))
-        with self._admin(name) as conn:
+            conn.execute(pgsql.SQL("CREATE DATABASE {}").format(db))
+        with self._admin(self._template(task)) as conn:
             conn.execute(pgsql.SQL("CREATE SCHEMA {}").format(pgsql.Identifier(task)))
+        with self._admin() as conn:
+            conn.execute(pgsql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(db))
+            conn.execute(pgsql.SQL("ALTER DATABASE {} WITH ALLOW_CONNECTIONS false").format(db))
 
     def create_episode(self, task: str) -> Episode:
         self.ensure_template(task)
@@ -47,6 +56,11 @@ class PostgresWarehouse(Warehouse):
         with self._admin() as conn:
             conn.execute(
                 pgsql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(role, pgsql.Literal(password))
+            )
+            conn.execute(
+                pgsql.SQL("ALTER ROLE {} SET statement_timeout = {}").format(
+                    role, pgsql.Literal(self.statement_timeout_ms)
+                )
             )
             conn.execute(
                 pgsql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE {}").format(
@@ -96,7 +110,10 @@ class PostgresWarehouse(Warehouse):
     def _run(self, dsn: str, query: str) -> QueryResult:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f"SET statement_timeout = {int(self.statement_timeout_ms)}")
-            cur = conn.execute(query)
+            try:
+                cur = conn.execute(query)
+            except psycopg.Error as e:
+                raise QueryError(str(e)) from e
             if cur.description is None:
                 return QueryResult(columns=[], rows=[])
             return QueryResult(columns=[c.name for c in cur.description], rows=cur.fetchall())

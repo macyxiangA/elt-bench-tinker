@@ -1,4 +1,4 @@
-"""P2: Postgres episodes are fresh, writable by their agent, and isolated from each other."""
+"""Postgres episodes are fresh, writable by their agent, and isolated from each other."""
 
 from __future__ import annotations
 
@@ -22,6 +22,14 @@ def test_episode_lifecycle_and_isolation(warehouse: PostgresWarehouse) -> None:
 
         # b's credentials cannot open a's database.
         other = dict(b.agent_env, PGDATABASE=a.id)
+        with pytest.raises(psycopg.OperationalError):
+            warehouse.execute(replace(b, agent_env=other), "SELECT 1")
+        # Nor log in as the admin with its own credentials minus the password.
+        admin = dict(b.agent_env, PGUSER="postgres", PGPASSWORD="")
+        with pytest.raises(psycopg.OperationalError):
+            warehouse.execute(replace(b, agent_env=admin), "SELECT 1")
+        # Nor the task template.
+        other = dict(b.agent_env, PGDATABASE=warehouse._template("trains"))
         with pytest.raises(psycopg.OperationalError):
             warehouse.execute(replace(b, agent_env=other), "SELECT 1")
     finally:

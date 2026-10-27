@@ -1,4 +1,4 @@
-"""The agent's three tools: bash (in its workspace), sql (in its namespace), submit."""
+"""The agent's three tools: bash (in its sandbox), sql (in its namespace), submit."""
 
 from __future__ import annotations
 
@@ -6,19 +6,20 @@ import asyncio
 import json
 from typing import Annotated
 
-from tinker_cookbook.sandbox import SandboxInterface
 from tinker_cookbook.tool_use import Tool, ToolResult, simple_tool_result, tool
 
-from elt_rl.warehouse.base import Episode, Warehouse
+from elt_rl.sandbox import DockerSandbox
+from elt_rl.warehouse.base import Episode, QueryError, Warehouse
 
-MAX_OUTPUT_CHARS = 16_384
+MAX_OUTPUT_BYTES = 16_384
 MAX_SQL_ROWS = 50
+MAX_CELL_CHARS = 200
 
 
 class EltTools:
     def __init__(
         self,
-        sandbox: SandboxInterface,
+        sandbox: DockerSandbox,
         warehouse: Warehouse,
         episode: Episode,
         command_timeout: int = 120,
@@ -35,10 +36,10 @@ class EltTools:
         The warehouse connection is preconfigured in the environment (e.g. `psql` works).
         """
         r = await self._sandbox.run_command(
-            command, timeout=self._command_timeout, max_output_bytes=MAX_OUTPUT_CHARS
+            command, timeout=self._command_timeout, max_output_bytes=MAX_OUTPUT_BYTES
         )
         return simple_tool_result(
-            json.dumps({"exit_code": r.exit_code, "stdout": r.stdout, "stderr": r.stderr})
+            f"exit_code: {r.exit_code}\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
         )
 
     @tool
@@ -46,11 +47,11 @@ class EltTools:
         """Run SQL in the warehouse and return up to 50 rows."""
         try:
             res = await asyncio.to_thread(self._warehouse.execute, self._episode, query)
-        except Exception as e:  # SQL errors are feedback for the agent, not crashes
-            return simple_tool_result(json.dumps({"error": str(e)[:MAX_OUTPUT_CHARS]}))
-        rows = [[str(v) for v in row] for row in res.rows[:MAX_SQL_ROWS]]
+        except QueryError as e:  # SQL errors are feedback for the agent, not crashes
+            return simple_tool_result(f"error: {str(e)[:MAX_OUTPUT_BYTES]}")
+        rows = [[str(v)[:MAX_CELL_CHARS] for v in row] for row in res.rows[:MAX_SQL_ROWS]]
         out = {"columns": res.columns, "rows": rows, "row_count": len(res.rows)}
-        return simple_tool_result(json.dumps(out)[:MAX_OUTPUT_CHARS])
+        return simple_tool_result(json.dumps(out))
 
     @tool
     async def submit(self) -> ToolResult:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,13 @@ class Task:
     eval_sql: dict[str, str]
     sort_keys: dict[str, list[str]]
     gt_dir: Path
+    # Stage 1 (EL): row count each raw source table must have in the warehouse.
+    source_rows: dict[str, int]
+
+
+def count_rows(path: Path) -> int:
+    with path.open(newline="") as f:
+        return sum(1 for _ in csv.reader(f)) - 1  # minus header
 
 
 def load_task(name: str, elt_bench_dir: Path, data_dir: Path) -> Task:
@@ -34,7 +42,8 @@ def load_task(name: str, elt_bench_dir: Path, data_dir: Path) -> Task:
     agent_files = {"data_model.yaml": data_model}
     for f in sorted((bench / "schemas" / name).glob("*.csv")):
         agent_files[f"schemas/{f.name}"] = f
-    for f in sorted((data_dir / name / "sources").glob("*.csv")):
+    sources = sorted((data_dir / name / "sources").glob("*.csv"))
+    for f in sources:
         agent_files[f"sources/{f.name}"] = f
 
     sql_dir = elt_bench_dir / "evaluation" / "sql" / name
@@ -47,4 +56,5 @@ def load_task(name: str, elt_bench_dir: Path, data_dir: Path) -> Task:
         eval_sql=eval_sql,
         sort_keys=all_keys.get(name, {}),
         gt_dir=data_dir / name / "gt",
+        source_rows={f.stem: count_rows(f) for f in sources},
     )

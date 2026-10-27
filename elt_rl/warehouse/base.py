@@ -8,6 +8,10 @@ from dataclasses import dataclass
 import pandas as pd
 
 
+class QueryError(Exception):
+    """A statement failed (bad SQL, missing table, timeout). Connection errors are not this."""
+
+
 @dataclass(frozen=True)
 class Episode:
     """One isolated namespace in the warehouse, owned by one rollout."""
@@ -30,6 +34,12 @@ class QueryResult:
 
 
 class Warehouse(ABC):
+    # True when episodes start with the raw source tables already loaded (ELT-Bench's
+    # Airbyte EL step ran on the template); False when the agent must load them itself.
+    sources_preloaded: bool
+    # Docker network for the agent's sandbox, so its shell can reach this warehouse.
+    sandbox_network: str
+
     @abstractmethod
     def create_episode(self, task: str) -> Episode:
         """Fresh namespace cloned from the task's template; the agent may only touch this."""
@@ -39,8 +49,8 @@ class Warehouse(ABC):
 
     @abstractmethod
     def execute(self, episode: Episode, sql: str) -> QueryResult:
-        """Run SQL with the agent's (restricted) credentials."""
+        """Run SQL with the episode's own (restricted) credentials."""
 
     @abstractmethod
     def fetch_df(self, episode: Episode, sql: str) -> pd.DataFrame:
-        """Run grader SQL with the grader's credentials."""
+        """Run grader SQL with the admin credentials."""

@@ -12,3 +12,5 @@ __pycache__/
 ELT-Bench/
 *.egg-info/
 .pytest_cache/
+AGENTS.md
+CLAUDE.md

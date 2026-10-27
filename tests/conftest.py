@@ -13,7 +13,7 @@ from elt_rl.warehouse.postgres import PostgresWarehouse
 
 @pytest.fixture(scope="session")
 def elt_bench_dir() -> Path:
-    path = Path(os.environ.get("ELT_BENCH_DIR", "ELT-Bench"))
+    path = Path(os.environ.get("ELT_BENCH_DIR") or "ELT-Bench")
     if not (path / "evaluation" / "eva_stage2.py").exists():
         pytest.fail(f"ELT-Bench checkout not found at {path}; set ELT_BENCH_DIR (see README)")
     return path
@@ -21,7 +21,7 @@ def elt_bench_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def warehouse() -> PostgresWarehouse:
-    dsn = os.environ.get("ELT_PG_DSN", "postgresql://postgres:postgres@localhost:5432/postgres")
+    dsn = os.environ.get("ELT_PG_DSN") or "postgresql://postgres:postgres@localhost:5432/postgres"
     try:
         psycopg.connect(dsn, connect_timeout=5).close()
     except psycopg.OperationalError as e:

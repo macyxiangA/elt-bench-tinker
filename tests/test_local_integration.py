@@ -1,8 +1,9 @@
 """Acceptance 1 (credential-free): drive the real env/tools/reward with scripted
-pipelines on local Postgres. Correct -> 1, wrong -> in (0, 1), empty -> 0.
+pipelines on local Postgres. Correct -> 1, wrong -> in (0, 1), empty -> 0, and a
+correct transform on an incomplete load -> 0 (stage 1 gate).
 
 Only the model is scripted; everything else (cookbook AgentToolMessageEnv,
-tools, warehouse, official comparator) is the code used in training.
+Docker sandbox, tools, warehouse, official comparator) is the code used in training.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import pytest
 from tinker_cookbook.renderers.base import Message
 
 from elt_rl.env import EltEnvGroupBuilder
-from elt_rl.reward import load_comparator
+from elt_rl.sandbox import DockerSandbox
 from elt_rl.scripted import TRAINS_TRANSFORM, PromptOnlyRenderer, call, run_scripted
 from elt_rl.task import load_task
 from elt_rl.warehouse.postgres import PostgresWarehouse
@@ -29,8 +30,10 @@ CREATE TABLE trains.cars (id int, train_id int, position int, shape text, len te
 \\copy trains.cars FROM 'sources/cars.csv' CSV HEADER
 SQL
 """
-
-
+# Same load, but one `cars` row is lost on the way.
+SHORT_LOAD = LOAD.replace(
+    "FROM 'sources/cars.csv'", "FROM PROGRAM 'head -n -1 sources/cars.csv'"
+)
 
 PIPELINES: dict[str, list[Message]] = {
     "correct": [
@@ -45,6 +48,11 @@ PIPELINES: dict[str, list[Message]] = {
         call("submit"),
     ],
     "empty": [call("submit")],
+    "short_load": [
+        call("bash", command=SHORT_LOAD),
+        call("sql", query=TRAINS_TRANSFORM.format(ns="trains", open_roof="none")),
+        call("submit"),
+    ],
 }
 
 
@@ -57,7 +65,7 @@ async def test_reward_separates_pipelines(
         task=task,
         warehouse=warehouse,
         renderer=PromptOnlyRenderer(),  # type: ignore[arg-type]
-        comparator=load_comparator(elt_bench_dir),
+        elt_bench_dir=elt_bench_dir,
         group_size=len(PIPELINES),
     )
     envs = await builder.make_envs()
@@ -72,6 +80,7 @@ async def test_reward_separates_pipelines(
     assert rewards["correct"] == 1.0
     assert 0.0 < rewards["wrong"] < 1.0
     assert rewards["empty"] == 0.0
+    assert rewards["short_load"] == 0.0
 
 
 def test_grader_files_stay_out_of_workspace(elt_bench_dir: Path) -> None:
@@ -85,3 +94,18 @@ def test_grader_files_stay_out_of_workspace(elt_bench_dir: Path) -> None:
         "sources/train.csv",
     }
     assert not any("gt" in p or p.endswith(".sql") for p in visible)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_sees_only_workspace(elt_bench_dir: Path) -> None:
+    task = load_task("trains", elt_bench_dir, FIXTURE_DATA)
+    sandbox = await DockerSandbox.create(task.agent_files, {}, "host")
+    try:
+        r = await sandbox.run_command("find . -type f | sort; whoami")
+        assert r.stdout.split() == [f"./{p}" for p in sorted(task.agent_files)] + ["agent"]
+        r = await sandbox.run_command(f"ls {task.gt_dir.resolve()}")
+        assert r.exit_code != 0
+        r = await sandbox.run_command("sleep 5", timeout=1)
+        assert r.exit_code == 124
+    finally:
+        await sandbox.cleanup()

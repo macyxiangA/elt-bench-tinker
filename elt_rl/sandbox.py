@@ -1,31 +1,24 @@
-"""Per-episode workspace + local subprocess backend for cookbook's SandboxInterface.
+"""The agent's shell: one Docker container per episode (image built from sandbox/Dockerfile).
 
-A local directory is enough for the credential-free test. A container backend
-(Docker on the lab server, Modal) can replace it behind the same interface.
+The container gets a copy of the task's agent-visible files in /workspace and
+the episode's warehouse credentials as env vars. It sees none of the host's
+files (ground truth, .env, other episodes). The network is the warehouse's
+choice: Docker's default bridge for a cloud warehouse, the host network for a
+local Postgres (whose admin login must then require a password).
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
+import secrets
 import shutil
-import signal
 import tempfile
 from pathlib import Path
 
 from tinker_cookbook.sandbox import SandboxResult
 
+IMAGE = "elt-sandbox"
 DEFAULT_MAX_OUTPUT_BYTES = 16_384
-
-
-def make_workspace(files: dict[str, Path], root: Path | None = None) -> Path:
-    """Copy the task's agent-visible files into a fresh directory."""
-    ws = Path(tempfile.mkdtemp(prefix="elt_ws_", dir=root))
-    for rel, src in files.items():
-        dst = ws / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-    return ws
 
 
 def _cap(data: bytes, limit: int) -> str:
@@ -33,65 +26,65 @@ def _cap(data: bytes, limit: int) -> str:
     return text + (f"\n... [truncated {len(data) - limit} bytes]" if len(data) > limit else "")
 
 
-class LocalSandbox:
-    def __init__(self, workdir: Path, env: dict[str, str]):
-        self.workdir = workdir
-        # Minimal env: no host secrets leak into the agent's shell.
-        self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(workdir), **env}
+async def _docker(*args: str, stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
+    proc = await asyncio.create_subprocess_exec(
+        "docker", *args,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(stdin)
+    return proc.returncode or 0, out, err
 
-    @property
-    def sandbox_id(self) -> str:
-        return str(self.workdir)
 
-    async def send_heartbeat(self, timeout: int = 30) -> None:
-        return None
+class DockerSandbox:
+    def __init__(self, name: str):
+        self.name = name
+
+    @classmethod
+    async def create(
+        cls, files: dict[str, Path], env: dict[str, str], network: str, image: str = IMAGE
+    ) -> DockerSandbox:
+        name = f"elt-sbx-{secrets.token_hex(6)}"
+        env_args = [a for k, v in env.items() for a in ("-e", f"{k}={v}")]
+        code, _, err = await _docker(
+            "run", "-d", "--rm", "--name", name, "--network", network,
+            "--memory", "4g", "--cpus", "2", "--pids-limit", "512",
+            *env_args, image, "sleep", "infinity",
+        )
+        if code:
+            raise RuntimeError(f"docker run failed: {err.decode()}")
+        sandbox = cls(name)
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, src in files.items():
+                dst = Path(tmp) / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+            # Stream a tar so the files land owned by the container user.
+            tar = await asyncio.create_subprocess_exec(
+                "tar", "-C", tmp, "-cf", "-", ".", stdout=asyncio.subprocess.PIPE
+            )
+            data, _ = await tar.communicate()
+        code, _, err = await _docker(
+            "exec", "-i", name, "tar", "-C", "/workspace", "-xf", "-", stdin=data
+        )
+        if code:
+            await sandbox.cleanup()
+            raise RuntimeError(f"copying workspace failed: {err.decode()}")
+        return sandbox
 
     async def run_command(
-        self,
-        command: str,
-        workdir: str | None = None,
-        timeout: int = 60,
-        max_output_bytes: int | None = None,
+        self, command: str, timeout: int = 60, max_output_bytes: int | None = None
     ) -> SandboxResult:
         limit = max_output_bytes or DEFAULT_MAX_OUTPUT_BYTES
-        proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            command,
-            cwd=workdir or self.workdir,
-            env=self.env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+        # `timeout` exits 124 when it had to stop the command; -k kills it if TERM is ignored.
+        code, out, err = await asyncio.wait_for(
+            _docker("exec", self.name, "timeout", "-k", "5", str(timeout), "bash", "-c", command),
+            timeout + 30,
         )
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
-        except TimeoutError:
-            os.killpg(proc.pid, signal.SIGKILL)
-            await proc.wait()
-            return SandboxResult(stdout="", stderr=f"timed out after {timeout}s", exit_code=124)
-        return SandboxResult(
-            stdout=_cap(out, limit), stderr=_cap(err, limit), exit_code=proc.returncode or 0
-        )
-
-    async def read_file(
-        self, path: str, max_bytes: int | None = None, timeout: int = 60
-    ) -> SandboxResult:
-        try:
-            data = (self.workdir / path).read_bytes()
-        except OSError as e:
-            return SandboxResult(stdout="", stderr=str(e), exit_code=1)
-        return SandboxResult(stdout=_cap(data, max_bytes or len(data)), stderr="", exit_code=0)
-
-    async def write_file(
-        self, path: str, content: str | bytes, executable: bool = False, timeout: int = 60
-    ) -> SandboxResult:
-        target = self.workdir / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content.encode() if isinstance(content, str) else content)
-        if executable:
-            target.chmod(0o755)
-        return SandboxResult(stdout="", stderr="", exit_code=0)
+        if code == 124:
+            err += f"\ntimed out after {timeout}s".encode()
+        return SandboxResult(stdout=_cap(out, limit), stderr=_cap(err, limit), exit_code=code)
 
     async def cleanup(self) -> None:
-        shutil.rmtree(self.workdir, ignore_errors=True)
+        await _docker("rm", "-f", self.name)

@@ -28,9 +28,9 @@ import yaml
 
 from elt_rl.airbyte import Airbyte
 from elt_rl.env import EltEnvGroupBuilder
-from elt_rl.reward import load_comparator
 from elt_rl.scripted import TRAINS_TRANSFORM, PromptOnlyRenderer, call, run_scripted
 from elt_rl.task import load_task
+from elt_rl.warehouse.base import QueryError
 from elt_rl.warehouse.snowflake import SCHEMA, SnowflakeWarehouse
 
 TASK = "trains"
@@ -50,7 +50,7 @@ def ensure(ab: Airbyte, kind: str, name: str, body: dict) -> str:
 
 def load_template(wh: SnowflakeWarehouse, bench: Path, expected: dict[str, int]) -> list[dict]:
     """Airbyte EL into the template database; returns the finished sync jobs."""
-    tmpl = wh.template_database(TASK)
+    tmpl = wh.ensure_template(TASK)
     config = yaml.safe_load((bench / "elt-bench" / "snowflake" / TASK / "config.yaml").read_text())
     ab = Airbyte.from_env()
     e = os.environ
@@ -58,13 +58,13 @@ def load_template(wh: SnowflakeWarehouse, bench: Path, expected: dict[str, int])
         "definitionId": SNOWFLAKE_DEST_DEF,
         "configuration": {
             "host": f"{e['ELT_SF_ACCOUNT']}.snowflakecomputing.com",
-            "role": e["ELT_SF_AGENT_ROLE"],
+            "role": e["ELT_SF_AIRBYTE_ROLE"],
             "warehouse": e["ELT_SF_WAREHOUSE"],
             "database": tmpl,
             "schema": SCHEMA,
-            "username": e["ELT_SF_AGENT_USER"],
+            "username": e["ELT_SF_AIRBYTE_USER"],
             "credentials": {"auth_type": "Username and Password",
-                            "password": e["ELT_SF_AGENT_PASSWORD"]},
+                            "password": e["ELT_SF_AIRBYTE_PASSWORD"]},
         },
     })
     sources = {
@@ -98,42 +98,41 @@ def load_template(wh: SnowflakeWarehouse, bench: Path, expected: dict[str, int])
 
 
 def template_counts(wh: SnowflakeWarehouse, expected: dict[str, int]) -> dict[str, int | None]:
-    tmpl = wh.template_database(TASK)
+    """Row count per expected table in the template; None if the table is missing."""
+    tmpl = wh.template_name(TASK)
     counts: dict[str, int | None] = {}
     for table in expected:
         try:
-            res = wh._run(wh.admin, f"SELECT COUNT(*) FROM {tmpl}.{SCHEMA}.{table}")
+            res = wh.admin_run(f"SELECT COUNT(*) FROM {tmpl}.{SCHEMA}.{table}")
             counts[table] = int(res.rows[0][0])
-        except Exception:
+        except QueryError:
             counts[table] = None
     return counts
 
 
-async def rollout(wh: SnowflakeWarehouse, bench: Path, data_dir: Path) -> dict:
-    """One scripted episode through the real env; returns transcript + our scores.
-
-    Leaves the episode database in place (caller grades it officially, then drops it).
-    """
+async def rollout_and_grade(wh: SnowflakeWarehouse, bench: Path, data_dir: Path) -> dict:
+    """One scripted episode through the real env, graded by our reward and by eva.py."""
     task = load_task(TASK, bench, data_dir)
     builder = EltEnvGroupBuilder(task=task, warehouse=wh, renderer=PromptOnlyRenderer(),  # type: ignore[arg-type]
-                                 comparator=load_comparator(bench), group_size=1)
-    [env] = await builder.make_envs()
-    episode = builder._episodes[0]
-    ns = episode.namespace
-    script = [
-        # Check the EL result, then build the model, then submit.
-        call("sql", query=f"SELECT 'cars' AS t, COUNT(*) AS n FROM {ns}.cars "
-                          f"UNION ALL SELECT 'train', COUNT(*) FROM {ns}.train"),
-        call("sql", query=TRAINS_TRANSFORM.format(ns=ns, open_roof="none")),
-        call("sql", query=f"SELECT * FROM {ns}.trains ORDER BY train_id LIMIT 5"),
-        call("submit"),
-    ]
-    reward, metrics = await run_scripted(env, script)
-    history = env.message_env.history
-    for sandbox in builder._sandboxes:
-        await sandbox.cleanup()
-    return {"episode": episode.id, "reward": reward, "metrics": metrics,
-            "transcript": json.loads(json.dumps(history, default=_jsonable))}
+                                 elt_bench_dir=bench, group_size=1)
+    try:
+        [env] = await builder.make_envs()
+        episode = builder.episodes[0]
+        ns = episode.namespace
+        script = [
+            # Check the EL result, then build the model, then submit.
+            call("sql", query=f"SELECT 'cars' AS t, COUNT(*) AS n FROM {ns}.cars "
+                              f"UNION ALL SELECT 'train', COUNT(*) FROM {ns}.train"),
+            call("sql", query=TRAINS_TRANSFORM.format(ns=ns, open_roof="none")),
+            call("sql", query=f"SELECT * FROM {ns}.trains ORDER BY train_id LIMIT 5"),
+            call("submit"),
+        ]
+        reward, metrics = await run_scripted(env, script)
+        official = official_eval(wh, bench, data_dir, episode.id)
+    finally:
+        await builder.cleanup()
+    return {"episode": episode.id, "reward": reward, "metrics": metrics, "official": official,
+            "transcript": json.loads(json.dumps(env.message_env.history, default=_jsonable))}
 
 
 def _jsonable(o: object) -> object:
@@ -143,11 +142,11 @@ def _jsonable(o: object) -> object:
 def official_eval(wh: SnowflakeWarehouse, bench: Path, data_dir: Path, episode_db: str) -> dict:
     """Run ELT-Bench's eva.py unchanged on a `TRAINS` clone of the episode."""
     run = f"elt_rl_{TASK}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
-    wh._admin_many([f"CREATE DATABASE {TASK.upper()} CLONE {episode_db}"])  # fails if it exists
+    wh.admin_run(f"CREATE DATABASE {TASK.upper()} CLONE {episode_db}")  # fails if it exists
     try:
         with tempfile.TemporaryDirectory(dir=data_dir) as tmp:
             cred = Path(tmp) / "snowflake_credential.json"
-            cred.write_text(json.dumps(wh.admin))
+            cred.write_text(json.dumps(wh.admin_connect_args()))
             cred.chmod(0o600)
             gt_root = Path(tmp) / "gt"
             gt_root.mkdir()
@@ -158,7 +157,7 @@ def official_eval(wh: SnowflakeWarehouse, bench: Path, data_dir: Path, episode_d
                 cwd=bench / "evaluation", check=True,
             )
     finally:
-        wh._admin_many([f"DROP DATABASE IF EXISTS {TASK.upper()}"])
+        wh.admin_run(f"DROP DATABASE IF EXISTS {TASK.upper()}")
     out = bench / "evaluation" / "agent_results" / run
     return {"folder": str(out),
             "stage1": (out / "results.log").read_text().strip().splitlines(),
@@ -175,6 +174,10 @@ def main() -> None:
     args = p.parse_args()
     bench, data_dir = args.elt_bench_dir.resolve(), args.data_dir.resolve()
     expected = json.loads((bench / "evaluation" / "table.json").read_text())[TASK]
+    # Our stage 1 counts rows of the data dir's source CSVs; they must match the official ones.
+    ours = load_task(TASK, bench, data_dir).source_rows
+    if ours != expected:
+        raise SystemExit(f"source CSV row counts {ours} != table.json {expected}")
 
     wh = SnowflakeWarehouse.from_env()
     record: dict = {"task": TASK, "started": datetime.now(timezone.utc).isoformat()}
@@ -182,13 +185,7 @@ def main() -> None:
         record["airbyte_jobs"] = load_template(wh, bench, expected)
     record["template_counts"] = template_counts(wh, expected)
 
-    result = asyncio.run(rollout(wh, bench, data_dir))
-    record.update(result)
-    episode = result["episode"]
-    try:
-        record["official"] = official_eval(wh, bench, data_dir, episode)
-    finally:
-        wh._admin_many([f"DROP DATABASE IF EXISTS {episode}"])
+    record.update(asyncio.run(rollout_and_grade(wh, bench, data_dir)))
 
     out = data_dir / TASK / f"rollout_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
     out.write_text(json.dumps(record, indent=2, default=str))

@@ -13,6 +13,7 @@ from typing import Any
 class Airbyte:
     def __init__(self, base: str, client_id: str, client_secret: str):
         self.base = base.rstrip("/")
+        self.token: str | None = None
         self.token = self._call("POST", "/api/v1/applications/token", {
             "client_id": client_id,
             "client_secret": client_secret,
@@ -31,10 +32,10 @@ class Airbyte:
         )
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
-        if getattr(self, "token", None):
+        if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = resp.read()
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"{method} {path} -> {e.code}: {e.read().decode()[:2000]}") from None
